@@ -1,0 +1,5 @@
+numpy>=1.24
+sounddevice>=0.4.6
+soundcard>=0.4.3
+PyQt5>=5.15
+pyqtgraph>=0.13
