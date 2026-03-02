@@ -22,7 +22,7 @@
 
 ```bash
 # 1) 克隆仓库
-git clone <你的仓库地址>
+git clone https://github.com/Ruiz1026/vocal-pich-tracker.git
 cd tune_test
 
 # 2) 创建并激活虚拟环境（可选但推荐）
@@ -44,9 +44,9 @@ python main.py
 
 运行后：
 
-1. 点击 `Start` 开始检测  
-2. 播放音乐或伴奏  
-3. 观察频率、音名、偏差与曲线变化  
+1. 点击 `Start` 开始检测
+2. 播放音乐或伴奏
+3. 观察频率、音名、偏差与曲线变化
 4. 点击 `Stop` 停止检测
 
 ## ⚙️ 依赖说明
@@ -61,13 +61,11 @@ python main.py
 
 ## 🛠️ 常见问题
 
-- 无法开始采集 / 提示设备错误  
+- 无法开始采集 / 提示设备错误
   检查系统音频设备是否正常、采样率是否可用，以及是否启用了可用的回采设备（WASAPI/Stereo Mix）。
-
-- 非 Windows 系统运行失败  
+- 非 Windows 系统运行失败
   当前项目实现以 Windows 桌面回采为主，非 Windows 默认不启用麦克风回退。
-
-- 看不到曲线  
+- 看不到曲线
   确认 `pyqtgraph` 已正确安装。
 
 ---
