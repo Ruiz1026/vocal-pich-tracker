@@ -69,5 +69,3 @@ python main.py
   确认 `pyqtgraph` 已正确安装。
 
 ---
-
-如果你希望，我也可以继续帮你补一版英文 README，或者加上项目截图区域（`assets/`）用于 GitHub 展示。 📌
