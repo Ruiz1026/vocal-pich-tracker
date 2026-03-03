@@ -20,17 +20,32 @@ def main() -> int:
 
     window.start_clicked.connect(engine.start)
     window.stop_clicked.connect(engine.stop)
+    window.mode_changed.connect(engine.set_capture_mode)
+    window.desktop_device_changed.connect(engine.set_desktop_device)
+    window.microphone_device_changed.connect(engine.set_microphone_device)
 
     engine.pitch_updated.connect(window.on_pitch_result)
     engine.status_changed.connect(window.set_status)
 
+    def _refresh_device_lists(force_refresh: bool = True) -> None:
+        desktop_devices = engine.list_desktop_devices(force_refresh=force_refresh)
+        microphone_devices = engine.list_microphone_devices(force_refresh=force_refresh)
+        window.set_desktop_devices(desktop_devices, engine.selected_desktop_device_id)
+        window.set_microphone_devices(microphone_devices, engine.selected_microphone_device_id)
+        engine.set_desktop_device(engine.selected_desktop_device_id)
+        engine.set_microphone_device(engine.selected_microphone_device_id)
+
+    window.refresh_devices_clicked.connect(lambda: _refresh_device_lists(True))
+
     def _show_error(msg: str) -> None:
         window.set_status(msg)
         QtWidgets.QMessageBox.critical(window, "Error", msg)
-        window.start_button.setEnabled(True)
-        window.stop_button.setEnabled(False)
+        window.set_running(False)
 
     engine.error_occurred.connect(_show_error)
+    engine.set_capture_mode("desktop")
+    window.set_capture_mode("desktop")
+    _refresh_device_lists(force_refresh=True)
 
     window.show()
     code = app.exec_()

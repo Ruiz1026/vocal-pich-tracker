@@ -72,6 +72,11 @@ class AudioEngine(QtCore.QObject):
         self._secondary_frame_size = 2048
         self._window_secondary = np.hanning(self._secondary_frame_size).astype(np.float32)
         self._probe_info = ""
+        self.capture_mode = "desktop"
+        self.selected_microphone_device_id: Optional[str] = None
+        self.selected_desktop_device_id: Optional[str] = None
+        self._microphone_sources: List[dict] = []
+        self._desktop_sources: List[dict] = []
 
         # Temporal stabilizer for smoother real-time tracking.
         self._freq_history = deque(maxlen=5)
@@ -88,6 +93,206 @@ class AudioEngine(QtCore.QObject):
         self._pending_jump_count = 0
         self._strict_min_confidence = 0.26
         self._consensus_max_semitone_diff = 1.0
+
+    def set_capture_mode(self, mode: str) -> None:
+        if mode not in {"desktop", "microphone"}:
+            return
+        self.capture_mode = mode
+
+    def set_microphone_device(self, source_id: Optional[str]) -> None:
+        self.selected_microphone_device_id = source_id or None
+
+    def set_desktop_device(self, source_id: Optional[str]) -> None:
+        self.selected_desktop_device_id = source_id or None
+
+    def list_microphone_devices(self, force_refresh: bool = False) -> List[dict]:
+        if force_refresh or not self._microphone_sources:
+            self._microphone_sources = self._enumerate_microphone_sources()
+
+        if not self._microphone_sources:
+            self.selected_microphone_device_id = None
+            return []
+
+        valid_ids = {item["id"] for item in self._microphone_sources}
+        if self.selected_microphone_device_id not in valid_ids:
+            default_item = next((item for item in self._microphone_sources if item.get("is_default")), None)
+            self.selected_microphone_device_id = (default_item or self._microphone_sources[0])["id"]
+
+        return [{"id": item["id"], "label": item["label"]} for item in self._microphone_sources]
+
+    def list_desktop_devices(self, force_refresh: bool = False) -> List[dict]:
+        if force_refresh or not self._desktop_sources:
+            self._desktop_sources = self._enumerate_desktop_sources()
+
+        if not self._desktop_sources:
+            self.selected_desktop_device_id = None
+            return []
+
+        valid_ids = {item["id"] for item in self._desktop_sources}
+        if self.selected_desktop_device_id not in valid_ids:
+            default_item = next((item for item in self._desktop_sources if item.get("is_default")), None)
+            self.selected_desktop_device_id = (default_item or self._desktop_sources[0])["id"]
+
+        return [{"id": item["id"], "label": item["label"]} for item in self._desktop_sources]
+
+    @staticmethod
+    def _safe_default_device(index: int) -> Optional[int]:
+        try:
+            pair = sd.default.device
+            if pair is None:
+                return None
+            value = pair[index]
+            if value is None:
+                return None
+            value = int(value)
+            return value if value >= 0 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_loopback_name(name_lower: str) -> bool:
+        return any(k in name_lower for k in ("loopback", "loop back", "回送", "环回", "回环", "回采"))
+
+    @staticmethod
+    def _is_stereo_mix_name(name_lower: str) -> bool:
+        return any(k in name_lower for k in ("stereo mix", "stereomix", "what u hear", "wave out", "mixed output", "立体声混音", "混音"))
+
+    @staticmethod
+    def _hostapi_name(hostapis: List[dict], hostapi_idx: int) -> str:
+        if hostapi_idx < 0 or hostapi_idx >= len(hostapis):
+            return "Unknown API"
+        return str(hostapis[hostapi_idx].get("name", "Unknown API"))
+
+    @staticmethod
+    def _find_source_by_id(source_id: Optional[str], items: List[dict]) -> Optional[dict]:
+        if not source_id:
+            return None
+        for item in items:
+            if item.get("id") == source_id:
+                return item
+        return None
+
+    def _enumerate_microphone_sources(self) -> List[dict]:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        default_input = self._safe_default_device(0)
+
+        sources: List[dict] = []
+        for idx, dev in enumerate(devices):
+            if int(dev.get("max_input_channels", 0)) <= 0:
+                continue
+
+            name = str(dev.get("name", ""))
+            name_lower = name.lower()
+            if self._is_loopback_name(name_lower) or self._is_stereo_mix_name(name_lower):
+                continue
+
+            hostapi_idx = int(dev.get("hostapi", -1))
+            hostapi_name = self._hostapi_name(hostapis, hostapi_idx)
+            is_default = idx == default_input
+            default_tag = " [默认]" if is_default else ""
+            sources.append(
+                {
+                    "id": f"mic:{idx}",
+                    "kind": "microphone_input",
+                    "device_index": idx,
+                    "is_default": is_default,
+                    "label": f"{name} ({hostapi_name}){default_tag}",
+                }
+            )
+
+        sources.sort(key=lambda item: (not item.get("is_default", False), item["label"].lower()))
+        return sources
+
+    @staticmethod
+    def _find_wasapi_hostapi_index(hostapis: List[dict]) -> Optional[int]:
+        for idx, host in enumerate(hostapis):
+            if "WASAPI" in str(host.get("name", "")).upper():
+                return idx
+        return None
+
+    def _enumerate_desktop_sources(self) -> List[dict]:
+        if platform.system() != "Windows":
+            return []
+
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        wasapi_index = self._find_wasapi_hostapi_index(hostapis)
+        if wasapi_index is None:
+            return []
+
+        default_output = self._safe_default_device(1)
+        sources: List[dict] = []
+        seen_ids = set()
+
+        for idx, dev in enumerate(devices):
+            if int(dev.get("hostapi", -1)) != wasapi_index:
+                continue
+            if int(dev.get("max_output_channels", 0)) <= 0:
+                continue
+            name = str(dev.get("name", ""))
+            is_default = idx == default_output
+            default_tag = " [默认]" if is_default else ""
+            source_id = f"desk_out:{idx}"
+            seen_ids.add(source_id)
+            sources.append(
+                {
+                    "id": source_id,
+                    "kind": "wasapi_output_loopback",
+                    "device_index": idx,
+                    "is_default": is_default,
+                    "hostapi_index": wasapi_index,
+                    "label": f"{name} (WASAPI 输出回采){default_tag}",
+                }
+            )
+
+        for idx, dev in enumerate(devices):
+            if int(dev.get("hostapi", -1)) != wasapi_index:
+                continue
+            if int(dev.get("max_input_channels", 0)) <= 0:
+                continue
+            name = str(dev.get("name", ""))
+            if not self._is_loopback_name(name.lower()):
+                continue
+            source_id = f"desk_loop_in:{idx}"
+            if source_id in seen_ids:
+                continue
+            seen_ids.add(source_id)
+            sources.append(
+                {
+                    "id": source_id,
+                    "kind": "wasapi_loopback_input",
+                    "device_index": idx,
+                    "is_default": False,
+                    "hostapi_index": wasapi_index,
+                    "label": f"{name} (WASAPI 环回输入)",
+                }
+            )
+
+        for idx, dev in enumerate(devices):
+            if int(dev.get("max_input_channels", 0)) <= 0:
+                continue
+            name = str(dev.get("name", ""))
+            if not self._is_stereo_mix_name(name.lower()):
+                continue
+            source_id = f"desk_mix:{idx}"
+            if source_id in seen_ids:
+                continue
+            seen_ids.add(source_id)
+            hostapi_name = self._hostapi_name(hostapis, int(dev.get("hostapi", -1)))
+            sources.append(
+                {
+                    "id": source_id,
+                    "kind": "stereo_mix_input",
+                    "device_index": idx,
+                    "is_default": False,
+                    "hostapi_index": int(dev.get("hostapi", -1)),
+                    "label": f"{name} ({hostapi_name}, Stereo Mix)",
+                }
+            )
+
+        sources.sort(key=lambda item: (not item.get("is_default", False), item["label"].lower()))
+        return sources
 
     def start(self) -> None:
         if self._running:
@@ -115,7 +320,13 @@ class AudioEngine(QtCore.QObject):
                         pass
                     self.stream = None
 
-            if started_mode is None and platform.system() == "Windows":
+            desktop_source = self._find_source_by_id(self.selected_desktop_device_id, self._desktop_sources)
+            should_try_soundcard_fallback = (
+                self.capture_mode == "desktop"
+                and platform.system() == "Windows"
+                and (desktop_source is None or desktop_source.get("kind") == "wasapi_output_loopback")
+            )
+            if started_mode is None and should_try_soundcard_fallback:
                 try:
                     self._start_soundcard_loopback()
                     started_mode = "soundcard default-speaker loopback"
@@ -209,127 +420,251 @@ class AudioEngine(QtCore.QObject):
         self.status_changed.emit("Audio capture stopped")
 
     def _build_stream_configs(self) -> List[Tuple[str, dict]]:
-        """Build multiple capture strategies and try them in order."""
+        if self.capture_mode == "microphone":
+            return self._build_microphone_stream_configs()
+        return self._build_desktop_stream_configs()
+
+    def _build_microphone_stream_configs(self) -> List[Tuple[str, dict]]:
+        blocksize = 1024
+        if not self._microphone_sources:
+            self.list_microphone_devices(force_refresh=True)
+
+        source = self._find_source_by_id(self.selected_microphone_device_id, self._microphone_sources)
+        if source is None and self._microphone_sources:
+            source = self._microphone_sources[0]
+            self.selected_microphone_device_id = source["id"]
+
+        if source is None:
+            default_input = self._safe_default_device(0)
+            if default_input is None:
+                raise RuntimeError("No microphone input device available")
+            source = {
+                "label": f"default input #{default_input}",
+                "device_index": default_input,
+            }
+
+        device_index = int(source["device_index"])
+        info = sd.query_devices(device_index)
+        channels = max(1, min(2, int(info.get("max_input_channels", 1))))
+        samplerate = int(info.get("default_samplerate", 48000))
+        return [
+            (
+                f"Microphone input ({source['label']})",
+                {
+                    "device": device_index,
+                    "samplerate": samplerate,
+                    "channels": channels,
+                    "dtype": "float32",
+                    "blocksize": blocksize,
+                    "latency": "low",
+                },
+            )
+        ]
+
+    def _build_desktop_stream_configs(self) -> List[Tuple[str, dict]]:
+        if platform.system() != "Windows":
+            if not self.allow_microphone_fallback:
+                raise RuntimeError(
+                    "Desktop capture mode is enabled, but this build supports desktop loopback on Windows only."
+                )
+            return self._build_microphone_stream_configs()
+
+        if not self._desktop_sources:
+            self.list_desktop_devices(force_refresh=True)
+
+        source = self._find_source_by_id(self.selected_desktop_device_id, self._desktop_sources)
+        if source is not None:
+            return self._build_desktop_configs_from_source(source)
+        return self._build_default_desktop_stream_configs()
+
+    def _build_default_desktop_stream_configs(self) -> List[Tuple[str, dict]]:
         blocksize = 1024
         configs: List[Tuple[str, dict]] = []
+        hostapis = sd.query_hostapis()
+        wasapi_index = self._find_wasapi_hostapi_index(hostapis)
+        if wasapi_index is None:
+            raise RuntimeError("WASAPI host API not found on this system")
 
-        if platform.system() == "Windows":
-            hostapis = sd.query_hostapis()
-            wasapi_index = None
-            for idx, host in enumerate(hostapis):
-                if "WASAPI" in host.get("name", "").upper():
-                    wasapi_index = idx
-                    break
+        output_device = self._safe_default_device(1)
+        if output_device is None:
+            candidate = hostapis[wasapi_index].get("default_output_device")
+            if candidate is not None and int(candidate) >= 0:
+                output_device = int(candidate)
 
-            if wasapi_index is None:
-                raise RuntimeError("WASAPI host API not found on this system")
+        if output_device is None:
+            raise RuntimeError("No valid default output device found for loopback capture")
 
-            output_device = sd.default.device[1]
-            if output_device is None or output_device < 0:
-                output_device = hostapis[wasapi_index]["default_output_device"]
+        output_info = sd.query_devices(output_device)
+        samplerate = int(output_info.get("default_samplerate", 48000))
+        output_name = str(output_info.get("name", output_device))
+        probe_lines = [f"Default output device: {output_name}"]
 
-            if output_device is None or output_device < 0:
-                raise RuntimeError("No valid default output device found for loopback capture")
-
-            output_info = sd.query_devices(output_device)
-            samplerate = int(output_info.get("default_samplerate", 48000))
-            output_name = str(output_info.get("name", output_device))
-            probe_lines = [f"Default output device: {output_name}"]
-
-            # Compatibility path 1: prefer explicit loopback input device (works on older wrappers).
-            loopback_inputs = self._find_wasapi_loopback_input_devices(wasapi_index, output_info)
-            if loopback_inputs:
-                loop_names = []
-                for loopback_input in loopback_inputs:
-                    loopback_info = sd.query_devices(loopback_input)
-                    loop_names.append(str(loopback_info.get("name", loopback_input)))
-                probe_lines.append("WASAPI input candidates: " + "; ".join(loop_names))
-            else:
-                probe_lines.append("WASAPI input candidates: none")
-
+        loopback_inputs = self._find_wasapi_loopback_input_devices(wasapi_index, output_info)
+        if loopback_inputs:
+            loop_names = []
             for loopback_input in loopback_inputs:
                 loopback_info = sd.query_devices(loopback_input)
-                channels = max(1, min(2, int(loopback_info.get("max_input_channels", 2))))
-                configs.append(("WASAPI explicit loopback device", {
-                    "device": loopback_input,
-                    "samplerate": samplerate,
-                    "channels": channels,
-                    "dtype": "float32",
-                    "blocksize": blocksize,
-                    "latency": "low",
-                }))
+                loop_names.append(str(loopback_info.get("name", loopback_input)))
+            probe_lines.append("WASAPI input candidates: " + "; ".join(loop_names))
+        else:
+            probe_lines.append("WASAPI input candidates: none")
 
-            # Compatibility path 2: use WasapiSettings(loopback=True) when supported.
-            extra_settings = self._create_wasapi_loopback_settings()
-            if extra_settings is not None:
-                channels = max(1, min(2, int(output_info.get("max_output_channels", 2))))
-                configs.append(("WASAPI output + WasapiSettings(loopback=True)", {
-                    "device": output_device,
-                    "samplerate": samplerate,
-                    "channels": channels,
-                    "dtype": "float32",
-                    "blocksize": blocksize,
-                    "latency": "low",
-                    "extra_settings": extra_settings,
-                }))
-
-            # Compatibility path 3: some builds expose desktop capture as Stereo Mix.
-            stereo_mix = self._find_stereo_mix_input_device()
-            if stereo_mix is not None:
-                sm_info = sd.query_devices(stereo_mix)
-                sm_sr = int(sm_info.get("default_samplerate", samplerate))
-                channels = max(1, min(2, int(sm_info.get("max_input_channels", 2))))
-                configs.append(("Stereo Mix input device", {
-                    "device": stereo_mix,
-                    "samplerate": sm_sr,
-                    "channels": channels,
-                    "dtype": "float32",
-                    "blocksize": blocksize,
-                    "latency": "low",
-                }))
-                probe_lines.append(f"Stereo Mix candidate: {sm_info.get('name', stereo_mix)}")
-            else:
-                probe_lines.append("Stereo Mix candidate: none")
-
-            self._probe_info = "\n".join(probe_lines)
-
-            # Optional fallback: default input (usually microphone).
-            if self.allow_microphone_fallback:
-                default_input = sd.default.device[0]
-                if default_input is not None and default_input >= 0:
-                    in_info = sd.query_devices(default_input)
-                    in_sr = int(in_info.get("default_samplerate", samplerate))
-                    channels = max(1, min(2, int(in_info.get("max_input_channels", 1))))
-                    configs.append(("Default input fallback (microphone)", {
-                        "device": default_input,
-                        "samplerate": in_sr,
+        for loopback_input in loopback_inputs:
+            loopback_info = sd.query_devices(loopback_input)
+            channels = max(1, min(2, int(loopback_info.get("max_input_channels", 2))))
+            configs.append(
+                (
+                    "WASAPI explicit loopback device",
+                    {
+                        "device": loopback_input,
+                        "samplerate": samplerate,
                         "channels": channels,
                         "dtype": "float32",
                         "blocksize": blocksize,
                         "latency": "low",
-                    }))
-            return configs
-
-        # Non-Windows desktop loopback is not implemented in this project.
-        if not self.allow_microphone_fallback:
-            raise RuntimeError(
-                "Desktop-only capture mode is enabled. "
-                "This build supports desktop loopback on Windows only."
+                    },
+                )
             )
 
-        default_input = sd.default.device[0]
-        device_info = sd.query_devices(default_input)
-        channels = max(1, min(2, int(device_info.get("max_input_channels", 1))))
-        samplerate = int(device_info.get("default_samplerate", 48000))
-        configs.append(("Default input fallback (microphone)", {
-            "device": default_input,
-            "samplerate": samplerate,
-            "channels": channels,
-            "dtype": "float32",
-            "blocksize": blocksize,
-            "latency": "low",
-        }))
+        extra_settings = self._create_wasapi_loopback_settings()
+        if extra_settings is not None:
+            channels = max(1, min(2, int(output_info.get("max_output_channels", 2))))
+            configs.append(
+                (
+                    "WASAPI output + WasapiSettings(loopback=True)",
+                    {
+                        "device": output_device,
+                        "samplerate": samplerate,
+                        "channels": channels,
+                        "dtype": "float32",
+                        "blocksize": blocksize,
+                        "latency": "low",
+                        "extra_settings": extra_settings,
+                    },
+                )
+            )
+
+        stereo_mix = self._find_stereo_mix_input_device()
+        if stereo_mix is not None:
+            sm_info = sd.query_devices(stereo_mix)
+            sm_sr = int(sm_info.get("default_samplerate", samplerate))
+            channels = max(1, min(2, int(sm_info.get("max_input_channels", 2))))
+            configs.append(
+                (
+                    "Stereo Mix input device",
+                    {
+                        "device": stereo_mix,
+                        "samplerate": sm_sr,
+                        "channels": channels,
+                        "dtype": "float32",
+                        "blocksize": blocksize,
+                        "latency": "low",
+                    },
+                )
+            )
+            probe_lines.append(f"Stereo Mix candidate: {sm_info.get('name', stereo_mix)}")
+        else:
+            probe_lines.append("Stereo Mix candidate: none")
+
+        self._probe_info = "\n".join(probe_lines)
+
+        if self.allow_microphone_fallback:
+            default_input = self._safe_default_device(0)
+            if default_input is not None:
+                in_info = sd.query_devices(default_input)
+                in_sr = int(in_info.get("default_samplerate", samplerate))
+                channels = max(1, min(2, int(in_info.get("max_input_channels", 1))))
+                configs.append(
+                    (
+                        "Default input fallback (microphone)",
+                        {
+                            "device": default_input,
+                            "samplerate": in_sr,
+                            "channels": channels,
+                            "dtype": "float32",
+                            "blocksize": blocksize,
+                            "latency": "low",
+                        },
+                    )
+                )
+
         return configs
+
+    def _build_desktop_configs_from_source(self, source: dict) -> List[Tuple[str, dict]]:
+        blocksize = 1024
+        source_kind = str(source.get("kind", ""))
+        source_label = str(source.get("label", "selected source"))
+        device_index = int(source.get("device_index", -1))
+        if device_index < 0:
+            raise RuntimeError("Invalid selected desktop device")
+
+        if source_kind == "wasapi_output_loopback":
+            hostapis = sd.query_hostapis()
+            wasapi_index = self._find_wasapi_hostapi_index(hostapis)
+            if wasapi_index is None:
+                raise RuntimeError("WASAPI host API not found on this system")
+
+            output_info = sd.query_devices(device_index)
+            samplerate = int(output_info.get("default_samplerate", 48000))
+            configs: List[Tuple[str, dict]] = []
+
+            loopback_inputs = self._find_wasapi_loopback_input_devices(wasapi_index, output_info)
+            for loopback_input in loopback_inputs:
+                loopback_info = sd.query_devices(loopback_input)
+                channels = max(1, min(2, int(loopback_info.get("max_input_channels", 2))))
+                configs.append(
+                    (
+                        f"WASAPI explicit loopback ({source_label})",
+                        {
+                            "device": loopback_input,
+                            "samplerate": samplerate,
+                            "channels": channels,
+                            "dtype": "float32",
+                            "blocksize": blocksize,
+                            "latency": "low",
+                        },
+                    )
+                )
+
+            extra_settings = self._create_wasapi_loopback_settings()
+            if extra_settings is not None:
+                channels = max(1, min(2, int(output_info.get("max_output_channels", 2))))
+                configs.append(
+                    (
+                        f"WASAPI output loopback ({source_label})",
+                        {
+                            "device": device_index,
+                            "samplerate": samplerate,
+                            "channels": channels,
+                            "dtype": "float32",
+                            "blocksize": blocksize,
+                            "latency": "low",
+                            "extra_settings": extra_settings,
+                        },
+                    )
+                )
+
+            if not configs:
+                self._probe_info = f"Selected output has no loopback path: {source_label}"
+                return []
+            return configs
+
+        info = sd.query_devices(device_index)
+        channels = max(1, min(2, int(info.get("max_input_channels", 2))))
+        samplerate = int(info.get("default_samplerate", 48000))
+        return [
+            (
+                f"Desktop capture input ({source_label})",
+                {
+                    "device": device_index,
+                    "samplerate": samplerate,
+                    "channels": channels,
+                    "dtype": "float32",
+                    "blocksize": blocksize,
+                    "latency": "low",
+                },
+            )
+        ]
 
     @staticmethod
     def _create_wasapi_loopback_settings():
@@ -573,26 +908,13 @@ class AudioEngine(QtCore.QObject):
     @staticmethod
     def _find_stereo_mix_input_device() -> Optional[int]:
         """Find legacy desktop-capture inputs such as Stereo Mix / What U Hear."""
-        keywords = [
-            "stereo mix",
-            "stereomix",
-            "what u hear",
-            "wave out",
-            "mixed output",
-            "立体声混音",
-            "混音",
-        ]
-
         best_idx = None
         best_score = -1
         for idx, dev in enumerate(sd.query_devices()):
             if int(dev.get("max_input_channels", 0)) <= 0:
                 continue
             name = str(dev.get("name", "")).lower()
-            score = 0
-            for k in keywords:
-                if k in name:
-                    score += 1
+            score = 1 if AudioEngine._is_stereo_mix_name(name) else 0
             if score > best_score:
                 best_score = score
                 best_idx = idx

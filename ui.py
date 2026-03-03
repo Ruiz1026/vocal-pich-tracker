@@ -104,6 +104,10 @@ class PianoKeyboardWidget(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     start_clicked = QtCore.pyqtSignal()
     stop_clicked = QtCore.pyqtSignal()
+    mode_changed = QtCore.pyqtSignal(str)
+    desktop_device_changed = QtCore.pyqtSignal(object)
+    microphone_device_changed = QtCore.pyqtSignal(object)
+    refresh_devices_clicked = QtCore.pyqtSignal()
 
     NOTE_TO_PC = {
         "C": 0,
@@ -122,7 +126,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Desktop Audio Real-Time Pitch Detector")
+        self.setWindowTitle("Desktop/Microphone Audio Real-Time Pitch Detector")
         self.resize(980, 720)
 
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "app_icon.svg")
@@ -130,6 +134,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.setWindowIcon(QtGui.QIcon(icon_path))
 
         self._history = deque(maxlen=280)
+        self._capture_mode = "desktop"
+        self._is_running = False
         self._setup_style()
 
         root = QtWidgets.QWidget()
@@ -142,7 +148,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         title = QtWidgets.QLabel("Vocal Pitch Tracker")
         title.setObjectName("title")
-        subtitle = QtWidgets.QLabel("Realtime pitch analysis from desktop playback audio")
+        subtitle = QtWidgets.QLabel("Realtime pitch analysis from desktop audio or microphone input")
         subtitle.setObjectName("subtitle")
         layout.addWidget(title)
         layout.addWidget(subtitle)
@@ -176,6 +182,57 @@ class MainWindow(QtWidgets.QMainWindow):
         panel_layout.addWidget(self.conf_value, 2, 1)
         layout.addWidget(panel)
 
+        source_panel = QtWidgets.QFrame()
+        source_panel.setObjectName("panel")
+        source_layout = QtWidgets.QGridLayout(source_panel)
+        source_layout.setContentsMargins(16, 12, 16, 12)
+        source_layout.setHorizontalSpacing(12)
+        source_layout.setVerticalSpacing(10)
+
+        mode_caption = QtWidgets.QLabel("采集模式")
+        mode_caption.setObjectName("caption")
+        source_layout.addWidget(mode_caption, 0, 0)
+
+        mode_buttons = QtWidgets.QHBoxLayout()
+        mode_buttons.setSpacing(8)
+        self.desktop_mode_button = QtWidgets.QPushButton("桌面音频")
+        self.desktop_mode_button.setObjectName("modeButton")
+        self.desktop_mode_button.setCheckable(True)
+        self.microphone_mode_button = QtWidgets.QPushButton("麦克风")
+        self.microphone_mode_button.setObjectName("modeButton")
+        self.microphone_mode_button.setCheckable(True)
+
+        self.mode_button_group = QtWidgets.QButtonGroup(self)
+        self.mode_button_group.setExclusive(True)
+        self.mode_button_group.addButton(self.desktop_mode_button)
+        self.mode_button_group.addButton(self.microphone_mode_button)
+        self.desktop_mode_button.setChecked(True)
+
+        mode_buttons.addWidget(self.desktop_mode_button)
+        mode_buttons.addWidget(self.microphone_mode_button)
+        mode_buttons.addStretch(1)
+        source_layout.addLayout(mode_buttons, 0, 1, 1, 2)
+
+        desktop_caption = QtWidgets.QLabel("桌面设备")
+        desktop_caption.setObjectName("caption")
+        self.desktop_device_combo = QtWidgets.QComboBox()
+        self.desktop_device_combo.setObjectName("deviceCombo")
+        source_layout.addWidget(desktop_caption, 1, 0)
+        source_layout.addWidget(self.desktop_device_combo, 1, 1)
+
+        self.refresh_devices_button = QtWidgets.QPushButton("刷新设备")
+        self.refresh_devices_button.setObjectName("secondaryButton")
+        source_layout.addWidget(self.refresh_devices_button, 1, 2)
+
+        microphone_caption = QtWidgets.QLabel("麦克风设备")
+        microphone_caption.setObjectName("caption")
+        self.microphone_device_combo = QtWidgets.QComboBox()
+        self.microphone_device_combo.setObjectName("deviceCombo")
+        source_layout.addWidget(microphone_caption, 2, 0)
+        source_layout.addWidget(self.microphone_device_combo, 2, 1, 1, 2)
+
+        layout.addWidget(source_panel)
+
         controls = QtWidgets.QHBoxLayout()
         controls.setSpacing(10)
         self.start_button = QtWidgets.QPushButton("Start")
@@ -186,6 +243,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.start_button.clicked.connect(self._on_start)
         self.stop_button.clicked.connect(self._on_stop)
+        self.desktop_mode_button.clicked.connect(self._on_desktop_mode_clicked)
+        self.microphone_mode_button.clicked.connect(self._on_microphone_mode_clicked)
+        self.desktop_device_combo.currentIndexChanged.connect(self._on_desktop_device_changed)
+        self.microphone_device_combo.currentIndexChanged.connect(self._on_microphone_device_changed)
+        self.refresh_devices_button.clicked.connect(lambda _checked=False: self.refresh_devices_clicked.emit())
 
         self.status_label = QtWidgets.QLabel("Status: Idle")
         self.status_label.setObjectName("status")
@@ -241,6 +303,7 @@ class MainWindow(QtWidgets.QMainWindow):
             chart_layout.addWidget(fallback)
 
         layout.addWidget(chart_panel, stretch=1)
+        self._update_source_controls_enabled()
 
     def _setup_style(self) -> None:
         self.setStyleSheet(
@@ -322,6 +385,42 @@ class MainWindow(QtWidgets.QMainWindow):
                 color: #4f688f;
                 font-size: 13px;
             }
+            #modeButton {
+                min-height: 32px;
+                min-width: 108px;
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: 600;
+                color: #33527e;
+                background-color: #ffffff;
+                border: 1px solid #c9d8ee;
+                padding: 0 12px;
+            }
+            #modeButton:hover {
+                background-color: #f1f6ff;
+            }
+            #modeButton:checked {
+                background-color: #2d7cf6;
+                color: #ffffff;
+                border-color: #2d7cf6;
+            }
+            #modeButton:disabled {
+                color: #96aac8;
+                border-color: #d8e3f3;
+            }
+            #deviceCombo {
+                min-height: 32px;
+                border-radius: 8px;
+                border: 1px solid #c9d8ee;
+                background-color: #ffffff;
+                color: #2b4368;
+                padding: 0 10px;
+            }
+            #deviceCombo:disabled {
+                color: #96aac8;
+                border-color: #d8e3f3;
+                background-color: #f7faff;
+            }
             #fallback {
                 color: #6a82aa;
                 font-size: 13px;
@@ -344,14 +443,90 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return (octave + 1) * 12 + MainWindow.NOTE_TO_PC[key]
 
+    def set_capture_mode(self, mode: str, emit_signal: bool = False) -> None:
+        if mode not in {"desktop", "microphone"}:
+            return
+        self._capture_mode = mode
+        self.desktop_mode_button.setChecked(mode == "desktop")
+        self.microphone_mode_button.setChecked(mode == "microphone")
+        self._update_source_controls_enabled()
+        if emit_signal:
+            self.mode_changed.emit(mode)
+
+    def set_desktop_devices(self, devices, selected_id=None) -> None:
+        self._set_device_combo_items(self.desktop_device_combo, devices, selected_id, "无可用桌面设备")
+
+    def set_microphone_devices(self, devices, selected_id=None) -> None:
+        self._set_device_combo_items(self.microphone_device_combo, devices, selected_id, "无可用麦克风设备")
+
+    def set_running(self, running: bool) -> None:
+        self._is_running = running
+        self.start_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
+        self._update_source_controls_enabled()
+
+    def _set_device_combo_items(self, combo: QtWidgets.QComboBox, devices, selected_id, empty_text: str) -> None:
+        previous_id = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+
+        for item in devices:
+            combo.addItem(item["label"], item["id"])
+
+        if combo.count() == 0:
+            combo.addItem(empty_text, None)
+
+        target_id = selected_id if selected_id is not None else previous_id
+        matched = False
+        if target_id is not None:
+            for idx in range(combo.count()):
+                if combo.itemData(idx) == target_id:
+                    combo.setCurrentIndex(idx)
+                    matched = True
+                    break
+        if not matched and combo.count() > 0:
+            combo.setCurrentIndex(0)
+
+        combo.blockSignals(False)
+        self._update_source_controls_enabled()
+
+    def _combo_has_valid_item(self, combo: QtWidgets.QComboBox) -> bool:
+        return combo.count() > 0 and combo.itemData(combo.currentIndex()) is not None
+
+    def _update_source_controls_enabled(self) -> None:
+        editable = not self._is_running
+        is_desktop = self._capture_mode == "desktop"
+        is_microphone = self._capture_mode == "microphone"
+
+        self.desktop_mode_button.setEnabled(editable)
+        self.microphone_mode_button.setEnabled(editable)
+        self.refresh_devices_button.setEnabled(editable)
+
+        self.desktop_device_combo.setEnabled(editable and is_desktop and self._combo_has_valid_item(self.desktop_device_combo))
+        self.microphone_device_combo.setEnabled(
+            editable and is_microphone and self._combo_has_valid_item(self.microphone_device_combo)
+        )
+
+    def _on_desktop_mode_clicked(self, _checked=False) -> None:
+        if self.desktop_mode_button.isChecked():
+            self.set_capture_mode("desktop", emit_signal=True)
+
+    def _on_microphone_mode_clicked(self, _checked=False) -> None:
+        if self.microphone_mode_button.isChecked():
+            self.set_capture_mode("microphone", emit_signal=True)
+
+    def _on_desktop_device_changed(self, _index: int) -> None:
+        self.desktop_device_changed.emit(self.desktop_device_combo.currentData())
+
+    def _on_microphone_device_changed(self, _index: int) -> None:
+        self.microphone_device_changed.emit(self.microphone_device_combo.currentData())
+
     def _on_start(self) -> None:
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
+        self.set_running(True)
         self.start_clicked.emit()
 
     def _on_stop(self) -> None:
-        self.stop_button.setEnabled(False)
-        self.start_button.setEnabled(True)
+        self.set_running(False)
         self.stop_clicked.emit()
 
     @QtCore.pyqtSlot(str)
